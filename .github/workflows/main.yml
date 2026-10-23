@@ -1,0 +1,939 @@
+name: Build Honored One plugin
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Create plugin files
+        run: |
+          mkdir -p src/main/java/dev/lofi/honored src/main/resources
+          cat > pom.xml <<'EOF_POM'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>dev.lofi</groupId>
+            <artifactId>HonoredOne</artifactId>
+            <version>1.5.0</version>
+            <packaging>jar</packaging>
+
+            <properties>
+              <maven.compiler.release>25</maven.compiler.release>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+
+            <repositories>
+              <repository>
+                <id>papermc</id>
+                <url>https://repo.papermc.io/repository/maven-public/</url>
+              </repository>
+            </repositories>
+
+            <dependencies>
+              <dependency>
+                <groupId>io.papermc.paper</groupId>
+                <artifactId>paper-api</artifactId>
+                <version>[26.2.build,)</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+          </project>
+          EOF_POM
+          cat > src/main/resources/plugin.yml <<'EOF_PLUGIN'
+          name: HonoredOne
+          version: 1.5.0
+          main: dev.lofi.honored.HonoredOne
+          api-version: '26.2'
+          description: Gojo-style "Honored One" swirl aura with a first-time awakening ceremony.
+          commands:
+            honored:
+              description: Toggle the Honored One aura on a player, list, clear, or set size
+              usage: /honored <player|clear|list|size>
+              permission: honored.use
+            honored1first:
+              description: First-time awakening ceremony for a new Honored One
+              usage: /honored1first <player>
+              aliases: [honoredfirst]
+              permission: honored.use
+            halo:
+              description: Toggle a golden halo above a player's head
+              usage: /halo <player>
+              aliases: [goldenhalo]
+              permission: honored.use
+            redwings:
+              description: Toggle red wings on a player
+              usage: /redwings <player>
+              aliases: [wings]
+              permission: honored.use
+            honoredcoords:
+              description: Show the Honored One's coordinates in a boss bar (updates every minute)
+              usage: /honoredcoords [on|off]
+              aliases: [honoredtrack, hcoords]
+              permission: honored.use
+          permissions:
+            honored.use:
+              default: op
+          EOF_PLUGIN
+          cat > src/main/java/dev/lofi/honored/HonoredOne.java <<'EOF_JAVA'
+          package dev.lofi.honored;
+
+          import net.kyori.adventure.bossbar.BossBar;
+          import net.kyori.adventure.text.Component;
+          import net.kyori.adventure.text.format.NamedTextColor;
+          import net.kyori.adventure.text.format.TextDecoration;
+          import net.kyori.adventure.text.minimessage.MiniMessage;
+          import net.kyori.adventure.text.minimessage.tag.resolver.Placeholder;
+          import net.kyori.adventure.text.minimessage.tag.resolver.TagResolver;
+          import net.kyori.adventure.title.Title;
+          import org.bukkit.Bukkit;
+          import org.bukkit.Color;
+          import org.bukkit.GameMode;
+          import org.bukkit.Location;
+          import org.bukkit.Material;
+          import org.bukkit.Particle;
+          import org.bukkit.Sound;
+          import org.bukkit.World;
+          import org.bukkit.command.Command;
+          import org.bukkit.command.CommandSender;
+          import org.bukkit.command.TabExecutor;
+          import org.bukkit.entity.Player;
+          import org.bukkit.entity.Pose;
+          import org.bukkit.event.EventHandler;
+          import org.bukkit.event.Listener;
+          import org.bukkit.event.entity.EntityResurrectEvent;
+          import org.bukkit.event.entity.PlayerDeathEvent;
+          import org.bukkit.event.player.PlayerJoinEvent;
+          import org.bukkit.event.player.PlayerMoveEvent;
+          import org.bukkit.event.player.PlayerQuitEvent;
+          import org.bukkit.event.player.PlayerToggleFlightEvent;
+          import org.bukkit.plugin.java.JavaPlugin;
+          import org.bukkit.potion.PotionEffect;
+          import org.bukkit.potion.PotionEffectType;
+          import org.bukkit.util.Vector;
+
+          import java.time.Duration;
+          import java.util.*;
+
+          public final class HonoredOne extends JavaPlugin implements Listener, TabExecutor {
+
+              // ---- normal aura tweaks (use /honored size <x> to scale everything in game) ----
+              private static final int SWIRL_TICKS = 16;   // time for the spiral to form once you stop
+              private static final int RING_TICKS  = 16;   // time for the ring to draw after the spiral
+              private static final double SWIRL_R  = 1.7;  // spiral radius
+              private static final double RING_R   = 1.95; // ring radius
+              private static final double BEHIND   = 0.9;  // how far behind the player the disc sits
+              private static final double CENTER_Y = 1.0;  // height of disc center
+              private static final double MOVE_EPS = 0.04; // movement that counts as "moving"
+
+              // ---- awakening timeline (ticks, 20 = 1 second) ----
+              private static final int RISE  = 50;  // lifted into the air
+              private static final int HOLD  = 70;  // hovering while the colored swirl forms
+              private static final int WHITE = 30;  // colors fade to white
+              // after that the player is lowered back to the ground
+
+              private static final Color FILL    = Color.fromRGB(255, 255, 255);
+              private static final Color OUTLINE = Color.fromRGB(150, 150, 150);
+              private static final boolean OUTLINE_ON = false; // true = grey outline around the white swirl
+
+              // bright blue, crimson, orange-red, cyan, gold, dark indigo, green, light gray
+              private static final Color[] PALETTE = {
+                      Color.fromRGB(0x1E6BFF), Color.fromRGB(0xDC143C), Color.fromRGB(0xFF5A1F), Color.fromRGB(0x4DE1FF),
+                      Color.fromRGB(0xFFD400), Color.fromRGB(0x5B21C9), Color.fromRGB(0x22DD44), Color.fromRGB(0xE6E6E6)
+              };
+
+              private static final class State {
+                  Location last;
+                  int still = 0; // ticks stationary
+              }
+
+              private static final class Awakening {
+                  final Location start;
+                  int t = 0;
+                  boolean prevAllowFlight;
+                  boolean prevInvulnerable;
+                  Awakening(Location start) { this.start = start; }
+              }
+
+              private final Map<UUID, State> marked = new HashMap<>();
+              private final Map<UUID, Awakening> awakening = new HashMap<>();
+              private final Set<UUID> halos = new HashSet<>();   // golden halo cosmetic
+              private final Set<UUID> wings = new HashSet<>();   // red wings cosmetic
+              private final Random rng = new Random();
+              private long tick = 0;
+              private double sizeMul = 1.0;                              // default size for everyone
+              private final Map<UUID, Double> sizes = new HashMap<>();   // per-player size overrides
+              private boolean tracking = false;                           // coords boss bar on/off
+              private int trackCountdown = 60;                            // seconds to next coords update
+              private final Map<UUID, BossBar> bars = new HashMap<>();
+
+              @Override
+              public void onEnable() {
+                  sizeMul = clamp(getConfig().getDouble("size", 1.0), 0.3, 4.0);
+                  for (String s : getConfig().getStringList("marked")) {
+                      try { marked.put(UUID.fromString(s), new State()); } catch (IllegalArgumentException ignored) {}
+                  }
+                  for (String s : getConfig().getStringList("halo")) {
+                      try { halos.add(UUID.fromString(s)); } catch (IllegalArgumentException ignored) {}
+                  }
+                  for (String s : getConfig().getStringList("wings")) {
+                      try { wings.add(UUID.fromString(s)); } catch (IllegalArgumentException ignored) {}
+                  }
+                  var sizeSec = getConfig().getConfigurationSection("sizes");
+                  if (sizeSec != null) {
+                      for (String k : sizeSec.getKeys(false)) {
+                          try { sizes.put(UUID.fromString(k), clamp(sizeSec.getDouble(k, 1.0), 0.3, 4.0)); }
+                          catch (IllegalArgumentException ignored) {}
+                      }
+                  }
+                  getServer().getPluginManager().registerEvents(this, this);
+                  for (String name : new String[]{"honored", "honored1first", "halo", "redwings", "honoredcoords"}) {
+                      var cmd = getCommand(name);
+                      if (cmd != null) { cmd.setExecutor(this); cmd.setTabCompleter(this); }
+                  }
+                  Bukkit.getScheduler().runTaskTimer(this, this::tickAll, 20L, 1L);
+                  if (getConfig().getBoolean("tracking", false)) setTracking(true);
+              }
+
+              @Override
+              public void onDisable() {
+                  for (UUID id : new ArrayList<>(awakening.keySet())) {
+                      Player p = Bukkit.getPlayer(id);
+                      if (p != null) endAwakening(p, awakening.get(id));
+                  }
+                  for (UUID id : marked.keySet()) {
+                      Player p = Bukkit.getPlayer(id);
+                      if (p != null) revoke(p);
+                  }
+                  clearBars();
+                  save();
+              }
+
+              private void save() {
+                  List<String> out = new ArrayList<>();
+                  marked.keySet().forEach(u -> out.add(u.toString()));
+                  getConfig().set("marked", out);
+                  getConfig().set("size", sizeMul);
+                  getConfig().set("tracking", tracking);
+                  getConfig().set("sizes", null);
+                  for (Map.Entry<UUID, Double> en : sizes.entrySet()) {
+                      getConfig().set("sizes." + en.getKey(), en.getValue());
+                  }
+                  List<String> h = new ArrayList<>();
+                  halos.forEach(u -> h.add(u.toString()));
+                  getConfig().set("halo", h);
+                  List<String> wl = new ArrayList<>();
+                  wings.forEach(u -> wl.add(u.toString()));
+                  getConfig().set("wings", wl);
+                  saveConfig();
+              }
+
+              private double sizeOf(UUID id) { return sizes.getOrDefault(id, sizeMul); }
+
+              private static double clamp(double v, double lo, double hi) { return Math.max(lo, Math.min(hi, v)); }
+
+              private static Color mix(Color a, Color b, double t) {
+                  return Color.fromRGB(
+                          (int) (a.getRed() + (b.getRed() - a.getRed()) * t),
+                          (int) (a.getGreen() + (b.getGreen() - a.getGreen()) * t),
+                          (int) (a.getBlue() + (b.getBlue() - a.getBlue()) * t));
+              }
+
+              // ---------- main loop ----------
+
+              private void tickAll() {
+                  tick++;
+                  for (UUID id : new ArrayList<>(awakening.keySet())) {
+                      Player p = Bukkit.getPlayer(id);
+                      Awakening a = awakening.get(id);
+                      if (p == null || a == null) { awakening.remove(id); continue; }
+                      stepAwakening(p, a);
+                  }
+                  if (tick % 2 == 0) renderAll();
+                  renderCosmetics();
+                  if (tracking && tick % 20 == 0) trackStep();
+                  if (tick % 20 == 0) refreshResistance();
+              }
+
+              // ---------- permanent Resistance I ----------
+
+              /** Re-applies Resistance I to every online Honored One (covers totem pops, milk, respawn). */
+              private void refreshResistance() {
+                  for (UUID id : marked.keySet()) {
+                      Player p = Bukkit.getPlayer(id);
+                      if (p != null && p.isOnline() && !p.isDead()) grant(p);
+                  }
+              }
+
+              // Resistance I + Speed I + Weaving, all permanent while someone is the Honored One
+              private static final PotionEffectType[] BUFFS = {
+                      PotionEffectType.RESISTANCE, PotionEffectType.SPEED, PotionEffectType.WEAVING
+              };
+
+              private void grant(Player p) {
+                  for (PotionEffectType type : BUFFS) {
+                      PotionEffect cur = p.getPotionEffect(type);
+                      boolean ours = cur != null && cur.getAmplifier() == 0 && cur.getDuration() == PotionEffect.INFINITE_DURATION;
+                      if (ours) continue;
+                      // don't downgrade a stronger effect the player already has
+                      if (cur != null && cur.getAmplifier() >= 1) continue;
+                      p.addPotionEffect(new PotionEffect(type, PotionEffect.INFINITE_DURATION, 0, true, false, true));
+                  }
+              }
+
+              private void revoke(Player p) {
+                  for (PotionEffectType type : BUFFS) {
+                      PotionEffect cur = p.getPotionEffect(type);
+                      if (cur != null && cur.getAmplifier() == 0 && cur.getDuration() == PotionEffect.INFINITE_DURATION) {
+                          p.removePotionEffect(type);
+                      }
+                  }
+              }
+
+              // ---------- coords boss bar ----------
+
+              private void setTracking(boolean on) {
+                  tracking = on;
+                  if (on) refreshBars();
+                  else clearBars();
+              }
+
+              private void clearBars() {
+                  for (BossBar b : bars.values()) {
+                      for (Player pl : Bukkit.getOnlinePlayers()) pl.hideBossBar(b);
+                  }
+                  bars.clear();
+              }
+
+              /** Re-reads every online Honored One's position and rebuilds the bars. */
+              private void refreshBars() {
+                  trackCountdown = 60;
+                  for (UUID id : new ArrayList<>(bars.keySet())) {
+                      Player p = Bukkit.getPlayer(id);
+                      if (p == null || !marked.containsKey(id)) {
+                          BossBar old = bars.remove(id);
+                          for (Player pl : Bukkit.getOnlinePlayers()) pl.hideBossBar(old);
+                      }
+                  }
+                  MiniMessage mm = MiniMessage.miniMessage();
+                  for (UUID id : marked.keySet()) {
+                      Player p = Bukkit.getPlayer(id);
+                      if (p == null || !p.isOnline()) continue;
+                      Location l = p.getLocation();
+                      World.Environment env = l.getWorld().getEnvironment();
+                      String dim = env == World.Environment.NETHER ? "Nether"
+                              : env == World.Environment.THE_END ? "End" : "Overworld";
+                      String coords = l.getBlockX() + ", " + l.getBlockY() + ", " + l.getBlockZ();
+                      Component title = mm.deserialize(
+                              "<bold><gradient:#ffffff:#8fd3ff>THE HONORED ONE</gradient></bold> <dark_gray>\u2022</dark_gray> "
+                                      + "<white><name></white> <dark_gray>\u2022</dark_gray> <yellow><coords></yellow> <gray>(<dim>)</gray>",
+                              Placeholder.unparsed("name", p.getName()),
+                              Placeholder.unparsed("coords", coords),
+                              Placeholder.unparsed("dim", dim));
+                      BossBar bar = bars.get(id);
+                      if (bar == null) {
+                          bar = BossBar.bossBar(title, 1.0f, BossBar.Color.WHITE, BossBar.Overlay.PROGRESS);
+                          bars.put(id, bar);
+                          for (Player pl : Bukkit.getOnlinePlayers()) pl.showBossBar(bar);
+                      } else {
+                          bar.name(title);
+                      }
+                      bar.progress(1.0f);
+                  }
+              }
+
+              /** Runs once a second: bar drains over 60s, then coords refresh. */
+              private void trackStep() {
+                  trackCountdown--;
+                  if (trackCountdown <= 0) {
+                      refreshBars();
+                      return;
+                  }
+                  float prog = (float) clamp(trackCountdown / 60.0, 0.0, 1.0);
+                  for (BossBar b : bars.values()) b.progress(prog);
+              }
+
+              private void renderAll() {
+                  for (Map.Entry<UUID, State> e : marked.entrySet()) {
+                      if (awakening.containsKey(e.getKey())) continue;
+                      Player p = Bukkit.getPlayer(e.getKey());
+                      if (p == null || !p.isOnline() || p.isDead() || p.getGameMode() == GameMode.SPECTATOR) continue;
+                      update(p, e.getValue());
+                  }
+              }
+
+              /** No aura while invisible, sneaking, or underwater. */
+              private boolean hidden(Player p) {
+                  if (p.isInvisible() || p.hasPotionEffect(PotionEffectType.INVISIBILITY)) return true;
+                  if (p.isSneaking()) return true;
+                  if (p.getPose() == Pose.SWIMMING) return true; // crawling or swimming
+                  Material m = p.getEyeLocation().getBlock().getType();
+                  return m == Material.WATER || m == Material.BUBBLE_COLUMN;
+              }
+
+              private void update(Player p, State st) {
+                  Location now = p.getLocation();
+
+                  if (hidden(p)) {
+                      st.still = 0;
+                      st.last = now.clone();
+                      return;
+                  }
+
+                  boolean moved = st.last == null
+                          || !st.last.getWorld().equals(now.getWorld())
+                          || st.last.distanceSquared(now) > MOVE_EPS * MOVE_EPS;
+
+                  if (moved) {
+                      if (st.still > 4) dissolve(p, st);
+                      st.still = 0;
+                      st.last = now.clone();
+                      return;
+                  }
+
+                  st.still += 2;
+                  drawNormal(p, st.still, false);
+              }
+
+              // ---------- cosmetics: golden halo + red wings (stack with the aura and each other) ----------
+
+              private static final Particle.DustOptions GOLD        = new Particle.DustOptions(Color.fromRGB(255, 200, 40), 0.8f);
+              private static final Particle.DustOptions GOLD_BRIGHT = new Particle.DustOptions(Color.fromRGB(255, 240, 150), 0.5f);
+              private static final Color RED_BASE = Color.fromRGB(255, 40, 50);
+              private static final Color RED_TIP  = Color.fromRGB(140, 0, 15);
+              private static final int FEATHERS = 6;
+
+              private boolean canShow(Player p) {
+                  return p != null && p.isOnline() && !p.isDead()
+                          && p.getGameMode() != GameMode.SPECTATOR
+                          && !p.isInvisible() && !p.hasPotionEffect(PotionEffectType.INVISIBILITY);
+              }
+
+              /** Not crawling, swimming or gliding (the halo/wings would float in the wrong place). */
+              private boolean upright(Player p) {
+                  return p.getPose() != Pose.SWIMMING && !p.isGliding() && !p.isSwimming();
+              }
+
+              private void renderCosmetics() {
+                  for (UUID id : halos) {
+                      Player p = Bukkit.getPlayer(id);
+                      if (canShow(p) && upright(p)) drawHalo(p);
+                  }
+                  for (UUID id : wings) {
+                      Player p = Bukkit.getPlayer(id);
+                      if (canShow(p) && upright(p)) drawWings(p);
+                  }
+              }
+
+              private void drawHalo(Player p) {
+                  World w = p.getWorld();
+                  double y = (p.isSneaking() ? 1.95 : 2.15) + Math.sin(tick * 0.1) * 0.04;
+                  Location base = p.getLocation().add(0, y, 0);
+                  // two gold dots spinning around above the head
+                  for (int k = 0; k < 2; k++) {
+                      double a = tick * 0.2 + k * Math.PI;
+                      Location l = base.clone().add(Math.cos(a) * 0.4, 0, Math.sin(a) * 0.4);
+                      w.spawnParticle(Particle.DUST, l, 1, 0, 0, 0, 0, GOLD, true);
+                      w.spawnParticle(Particle.DUST, l, 1, 0, 0, 0, 0, GOLD_BRIGHT, true);
+                  }
+              }
+
+              private void drawWings(Player p) {
+                  World w = p.getWorld();
+                  Vector f = forward(p);
+                  Vector right = new Vector(-f.getZ(), 0, f.getX());
+                  Vector back = f.clone().multiply(-1);
+                  Location base = p.getLocation().add(0, p.isSneaking() ? 1.1 : 1.35, 0).add(back.clone().multiply(0.2));
+                  double phi = Math.toRadians(20 + 20 * Math.sin(tick * 0.15)); // flap
+
+                  for (int side = -1; side <= 1; side += 2) {
+                      for (int i = 0; i < FEATHERS; i++) {
+                          double k = i / (double) (FEATHERS - 1);            // 0 = lowest feather, 1 = top
+                          double alpha = Math.toRadians(-25 + k * 100);      // fans from slightly down to up
+                          double len = 1.2 + 0.7 * Math.sin(k * 2.2);        // longer toward the top
+                          int steps = (int) (len / 0.2);
+                          for (int st = 1; st <= steps; st++) {
+                              double d = st * 0.2;
+                              double u = Math.cos(alpha) * d;
+                              double v = Math.sin(alpha) * d;
+                              double lateral = side * (0.12 + u * Math.cos(phi));
+                              double backd = u * Math.sin(phi);
+                              Location l = base.clone()
+                                      .add(right.clone().multiply(lateral))
+                                      .add(back.clone().multiply(backd))
+                                      .add(0, v, 0);
+                              Color col = mix(RED_BASE, RED_TIP, d / len);
+                              w.spawnParticle(Particle.DUST, l, 1, 0, 0, 0, 0, new Particle.DustOptions(col, 0.55f), true);
+                          }
+                      }
+                  }
+              }
+
+              // ---------- shapes ----------
+
+              private Vector forward(Player p) {
+                  Vector f = p.getLocation().getDirection().setY(0);
+                  if (f.lengthSquared() < 1e-6) f = new Vector(0, 0, 1);
+                  return f.normalize();
+              }
+
+              private Location center(Player p, double scale) {
+                  Vector f = forward(p);
+                  return p.getLocation().add(0, CENTER_Y, 0).subtract(f.multiply(BEHIND * scale));
+              }
+
+              private Vector[] axes(Player p) {
+                  Vector f = forward(p);
+                  Vector right = new Vector(-f.getZ(), 0, f.getX());
+                  return new Vector[]{right, new Vector(0, 1, 0)};
+              }
+
+              private Location at(Location c, Vector[] ax, double x, double y) {
+                  return c.clone().add(ax[0].clone().multiply(x)).add(ax[1].clone().multiply(y));
+              }
+
+              private void drawNormal(Player p, int still, boolean dissolve) {
+                  double sp = Math.min(1.0, still / (double) SWIRL_TICKS);
+                  double rp = Math.max(0.0, Math.min(1.0, (still - SWIRL_TICKS) / (double) RING_TICKS));
+                  drawShape(p, sp, rp, sizeOf(p.getUniqueId()), 1.0, false, dissolve);
+              }
+
+              /**
+               * sp = spiral progress 0..1, rp = ring progress 0..1.
+               * colored = rainbow-palette arms (awakening), blending to white by whiteMix.
+               * Normal look = white core with a grey outline on both sides.
+               */
+              private void drawShape(Player p, double sp, double rp, double scale, double whiteMix,
+                                     boolean colored, boolean dissolve) {
+                  World w = p.getWorld();
+                  Location c = center(p, scale);
+                  Vector[] ax = axes(p);
+                  double spin = colored ? tick * 0.096 : 0.0; // normal swirl is static
+                  boolean outline = OUTLINE_ON && (!colored || whiteMix > 0.5);
+                  boolean rod = !colored; // normal white look uses end rod particles
+
+                  int arms = colored ? PALETTE.length : 2;
+                  int perArm = colored ? 20 : 30;
+                  double turns = (colored ? 1.0 : 1.5) * Math.PI * 2;
+                  double swirlR = SWIRL_R * scale;
+                  for (int a = 0; a < arms; a++) {
+                      double armOff = a * Math.PI * 2 / arms;
+                      Color col = colored ? mix(PALETTE[a], FILL, whiteMix) : FILL;
+                      int upTo = (int) (perArm * sp);
+                      for (int i = 1; i <= upTo; i++) {
+                          if (rod && !dissolve && ((tick / 2 + i + a * 3) % 4) != 0) continue; // end rods linger, so stagger
+                          double f = i / (double) perArm;
+                          double ang = f * turns + armOff + spin;
+                          double r = f * swirlR;
+                          point(w, c, ax, Math.cos(ang) * r, Math.sin(ang) * r, Math.cos(ang), Math.sin(ang),
+                                  col, outline, dissolve, scale, rod);
+                      }
+                  }
+
+                  int ringPts = 48;
+                  int ringUpTo = (int) (ringPts * rp);
+                  double ringR = RING_R * scale;
+                  for (int i = 0; i < ringUpTo; i++) {
+                      if (rod && !dissolve && ((tick / 2 + i) % 4) != 0) continue;
+                      double ang = (Math.PI * 2 / ringPts) * i + spin * 0.4;
+                      Color col = colored ? mix(PALETTE[i % PALETTE.length], FILL, whiteMix) : FILL;
+                      point(w, c, ax, Math.cos(ang) * ringR, Math.sin(ang) * ringR, Math.cos(ang), Math.sin(ang),
+                              col, outline, dissolve, scale, rod);
+                  }
+              }
+
+              private void point(World w, Location c, Vector[] ax, double x, double y, double nx, double ny,
+                                 Color col, boolean outline, boolean dissolve, double scale, boolean rod) {
+                  if (rod) {
+                      Location rl = at(c, ax, x, y);
+                      if (dissolve) w.spawnParticle(Particle.END_ROD, rl, 1, 0.3, 0.3, 0.3, 0.04, null, true);
+                      else w.spawnParticle(Particle.END_ROD, rl, 1, 0, 0, 0, 0, null, true);
+                      return;
+                  }
+                  double off = dissolve ? 0.35 : 0;
+                  float sz = (float) clamp(scale, 0.5, 2.0);
+                  if (outline) {
+                      double e = 0.09 * Math.max(0.8, scale);
+                      Particle.DustOptions g = new Particle.DustOptions(OUTLINE, 0.6f * sz);
+                      w.spawnParticle(Particle.DUST, at(c, ax, x + nx * e, y + ny * e), 1, off, off, off, 0, g, true);
+                      w.spawnParticle(Particle.DUST, at(c, ax, x - nx * e, y - ny * e), 1, off, off, off, 0, g, true);
+                  }
+                  w.spawnParticle(Particle.DUST, at(c, ax, x, y), 1, off, off, off, 0,
+                          new Particle.DustOptions(col, (outline ? 0.7f : 0.85f) * sz), true);
+                  if (dissolve && rng.nextInt(8) == 0) {
+                      w.spawnParticle(Particle.END_ROD, at(c, ax, x, y), 1, 0.1, 0.1, 0.1, 0.04, null, true);
+                  }
+              }
+
+              /** Fires once when the player starts moving: whatever was formed bursts apart. */
+              private void dissolve(Player p, State st) {
+                  for (int i = 0; i < 2; i++) drawNormal(p, st.still, true);
+              }
+
+              // ---------- first-time awakening ----------
+
+              private void startAwakening(Player t) {
+                  UUID id = t.getUniqueId();
+                  State st = marked.computeIfAbsent(id, k -> new State());
+                  st.still = 0;
+                  st.last = null;
+                  halos.add(id); // the Honored One gets the halo automatically
+                  save();
+                  if (tracking) refreshBars();
+
+                  Awakening a = new Awakening(t.getLocation().clone());
+                  a.prevAllowFlight = t.getAllowFlight();
+                  a.prevInvulnerable = t.isInvulnerable();
+                  t.setAllowFlight(true);   // stops the "flying is not enabled" kick while hovering
+                  t.setFlying(false);
+                  t.setInvulnerable(true);
+                  t.setGravity(false);
+                  awakening.put(id, a);
+              }
+
+              private void endAwakening(Player p, Awakening a) {
+                  awakening.remove(p.getUniqueId());
+                  if (p.getLocation().getY() - a.start.getY() > 0.3) {
+                      Location l = p.getLocation();
+                      l.setY(a.start.getY());
+                      p.teleport(l);
+                  }
+                  p.setGravity(true);
+                  p.setInvulnerable(a.prevInvulnerable);
+                  p.setAllowFlight(a.prevAllowFlight);
+                  p.setFallDistance(0);
+                  p.setVelocity(new Vector(0, 0, 0));
+                  State st = marked.get(p.getUniqueId());
+                  if (st != null) { st.still = 0; st.last = null; }
+              }
+
+              private void stepAwakening(Player p, Awakening a) {
+                  int t = a.t++;
+                  World w = p.getWorld();
+                  p.setFallDistance(0);
+
+                  int holdEnd = RISE + HOLD;
+                  int whiteEnd = holdEnd + WHITE;
+
+                  if (t == 0) w.playSound(p.getLocation(), Sound.BLOCK_BEACON_ACTIVATE, 1.5f, 0.6f);
+                  if (t == RISE) {
+                      announce(p);
+                      w.playSound(p.getLocation(), Sound.ENTITY_LIGHTNING_BOLT_THUNDER, 2.0f, 0.8f);
+                  }
+                  if (t == holdEnd) {
+                      w.spawnParticle(Particle.END_ROD, p.getLocation().add(0, 1, 0), 80, 1.0, 1.0, 1.0, 0.2, null, true);
+                      w.playSound(p.getLocation(), Sound.BLOCK_AMETHYST_BLOCK_CHIME, 2.0f, 0.7f);
+                  }
+
+                  // ---- motion ----
+                  if (t < RISE) {
+                      double k = 1.0 - t / (double) RISE;
+                      p.setVelocity(new Vector(0, 0.03 + 0.09 * k, 0));
+                  } else if (t < whiteEnd) {
+                      p.setVelocity(new Vector(0, Math.sin(t * 0.15) * 0.01, 0));
+                  } else {
+                      double h = p.getLocation().getY() - a.start.getY();
+                      if (h <= 0.15 || t > whiteEnd + 160) {
+                          endAwakening(p, a);
+                          sizes.put(p.getUniqueId(), 0.5); // aura instantly drops to 0.5 size after the ceremony
+                          save();
+                          w.playSound(p.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 1.0f, 0.6f);
+                          return;
+                      }
+                      p.setVelocity(new Vector(0, -Math.min(0.12, 0.03 + h * 0.03), 0));
+                  }
+
+                  // ---- visuals (every 2 ticks) ----
+                  if (t % 2 != 0) return;
+                  if (t < whiteEnd) {
+                      double sp = Math.min(1.0, t / 60.0);
+                      double rp = clamp((t - 40) / 30.0, 0, 1);
+                      double mix = clamp((t - holdEnd) / (double) WHITE, 0, 1);
+                      double scale = (1.5 - 0.5 * mix) * sizeMul;
+                      drawShape(p, sp, rp, scale, mix, true, false);
+                      if (t < holdEnd) {
+                          for (int i = 0; i < 4; i++) {
+                              double ang = rng.nextDouble() * Math.PI * 2;
+                              Location l = p.getLocation().add(Math.cos(ang), rng.nextDouble() * 2.0, Math.sin(ang));
+                              w.spawnParticle(Particle.DUST, l, 1, 0, 0, 0, 0,
+                                      new Particle.DustOptions(PALETTE[rng.nextInt(PALETTE.length)], 1.0f), true);
+                          }
+                      }
+                  } else {
+                      drawShape(p, 1.0, 1.0, sizeMul, 1.0, false, false);
+                  }
+              }
+
+              private void announce(Player t) {
+                  MiniMessage mm = MiniMessage.miniMessage();
+                  TagResolver n = Placeholder.unparsed("name", t.getName());
+                  String bar = "<bold><gradient:#1e6bff:#dc143c:#ff5a1f:#ffd400:#22dd44:#4de1ff:#8a3bff:#ffffff>"
+                          + "\u2726 \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501 \u2726"
+                          + "</gradient></bold>";
+                  Bukkit.broadcast(Component.empty());
+                  Bukkit.broadcast(mm.deserialize(bar));
+                  Bukkit.broadcast(mm.deserialize(
+                          "<bold><gradient:#ffffff:#8fd3ff>\u26A1 T H E   H O N O R E D   O N E   H A S   A W O K E N . . . \u26A1</gradient></bold>"));
+                  Bukkit.broadcast(mm.deserialize(
+                          "<bold><gradient:#ff3b3b:#ffd400:#3bffea><name></gradient></bold> "
+                                  + "<gradient:#bfbfbf:#ffffff>\u02B0\u1D43\u02E2 \u1D47\u1D49\u1D9C\u1D52\u1D50\u1D49 \u1D57\u02B0\u1D49</gradient> "
+                                  + "<bold><gradient:#8fd3ff:#ffffff>H O N O R E D   O N E</gradient></bold>", n));
+                  Bukkit.broadcast(mm.deserialize(
+                          "<italic><gray>The heavens tremble... the world will never be the same.</gray></italic>"));
+                  Bukkit.broadcast(mm.deserialize(bar));
+                  Bukkit.broadcast(Component.empty());
+
+                  Title title = Title.title(
+                          mm.deserialize("<bold><gradient:#ffffff:#8fd3ff>THE HONORED ONE</gradient></bold>"),
+                          mm.deserialize("<gray>\u2726 <name> has awoken \u2726</gray>", n),
+                          Title.Times.times(Duration.ofMillis(500), Duration.ofMillis(3000), Duration.ofMillis(1000)));
+                  for (Player pl : Bukkit.getOnlinePlayers()) pl.showTitle(title);
+              }
+
+              // ---------- events ----------
+
+              @EventHandler
+              public void onDeath(PlayerDeathEvent e) {
+                  Player p = e.getPlayer();
+                  Awakening a = awakening.get(p.getUniqueId());
+                  if (a != null) endAwakening(p, a);
+                  if (!marked.containsKey(p.getUniqueId())) return;
+                  Bukkit.broadcast(Component.text("The Honored One Has Perished", NamedTextColor.RED, TextDecoration.BOLD));
+              }
+
+              @EventHandler(ignoreCancelled = true)
+              public void onTotem(EntityResurrectEvent e) {
+                  if (!(e.getEntity() instanceof Player)) return;
+                  Player p = (Player) e.getEntity();
+                  if (!marked.containsKey(p.getUniqueId())) return;
+                  // totem wipes effects, so put Resistance back one tick later
+                  Bukkit.getScheduler().runTask(this, () -> { if (p.isOnline()) grant(p); });
+              }
+
+              @EventHandler
+              public void onQuit(PlayerQuitEvent e) {
+                  Awakening a = awakening.get(e.getPlayer().getUniqueId());
+                  if (a != null) endAwakening(e.getPlayer(), a);
+                  if (tracking && marked.containsKey(e.getPlayer().getUniqueId())) {
+                      Bukkit.getScheduler().runTask(this, this::refreshBars);
+                  }
+              }
+
+              @EventHandler
+              public void onJoin(PlayerJoinEvent e) {
+                  if (!tracking) return;
+                  Player p = e.getPlayer();
+                  for (BossBar b : bars.values()) p.showBossBar(b);
+                  if (marked.containsKey(p.getUniqueId())) refreshBars();
+              }
+
+              @EventHandler
+              public void onToggleFlight(PlayerToggleFlightEvent e) {
+                  if (awakening.containsKey(e.getPlayer().getUniqueId())) e.setCancelled(true);
+              }
+
+              @EventHandler
+              public void onMove(PlayerMoveEvent e) {
+                  if (!awakening.containsKey(e.getPlayer().getUniqueId())) return;
+                  Location from = e.getFrom();
+                  Location to = e.getTo();
+                  if (to == null) return;
+                  if (from.getX() != to.getX() || from.getZ() != to.getZ()) {
+                      to.setX(from.getX());
+                      to.setZ(from.getZ());
+                      e.setTo(to);
+                  }
+              }
+
+              // ---------- commands ----------
+
+              @Override
+              public boolean onCommand(CommandSender s, Command c, String label, String[] a) {
+                  String cn = c.getName().toLowerCase();
+                  if (cn.equals("honoredcoords")) {
+                      boolean want;
+                      if (a.length == 0) want = !tracking;
+                      else if (a[0].equalsIgnoreCase("on")) want = true;
+                      else if (a[0].equalsIgnoreCase("off")) want = false;
+                      else {
+                          s.sendMessage(Component.text("Usage: /honoredcoords [on|off]", NamedTextColor.GRAY));
+                          return true;
+                      }
+                      setTracking(want);
+                      save();
+                      s.sendMessage(Component.text(want
+                              ? "Honored One coords bar is ON (updates every minute)."
+                              : "Honored One coords bar is OFF.", want ? NamedTextColor.AQUA : NamedTextColor.GRAY));
+                      return true;
+                  }
+                  if (cn.equals("halo") || cn.equals("redwings")) {
+                      boolean isHalo = cn.equals("halo");
+                      Set<UUID> set = isHalo ? halos : wings;
+                      String what = isHalo ? "Golden halo" : "Red wings";
+                      if (a.length != 1) {
+                          s.sendMessage(Component.text("Usage: /" + cn + " <player>", NamedTextColor.GRAY));
+                          return true;
+                      }
+                      Player t = Bukkit.getPlayerExact(a[0]);
+                      if (t == null) {
+                          s.sendMessage(Component.text("Player not found.", NamedTextColor.RED));
+                          return true;
+                      }
+                      if (set.remove(t.getUniqueId())) {
+                          s.sendMessage(Component.text(what + " removed from " + t.getName() + ".", NamedTextColor.GRAY));
+                      } else {
+                          set.add(t.getUniqueId());
+                          s.sendMessage(Component.text(what + " given to " + t.getName() + ".",
+                                  isHalo ? NamedTextColor.GOLD : NamedTextColor.RED));
+                      }
+                      save();
+                      return true;
+                  }
+
+                  if (c.getName().equalsIgnoreCase("honored1first")) {
+                      if (a.length != 1) {
+                          s.sendMessage(Component.text("Usage: /honored1first <player>", NamedTextColor.GRAY));
+                          return true;
+                      }
+                      Player t = Bukkit.getPlayerExact(a[0]);
+                      if (t == null) {
+                          s.sendMessage(Component.text("Player not found.", NamedTextColor.RED));
+                          return true;
+                      }
+                      if (awakening.containsKey(t.getUniqueId())) {
+                          s.sendMessage(Component.text(t.getName() + " is already awakening.", NamedTextColor.RED));
+                          return true;
+                      }
+                      startAwakening(t);
+                      return true;
+                  }
+
+                  if (a.length == 0) {
+                      s.sendMessage(Component.text("Usage: /honored <player|clear|list|size>", NamedTextColor.GRAY));
+                      return true;
+                  }
+                  String sub = a[0].toLowerCase();
+
+                  if (sub.equals("clear") && a.length == 1) {
+                      for (UUID u : marked.keySet()) {
+                          Player op = Bukkit.getPlayer(u);
+                          if (op != null) revoke(op);
+                      }
+                      marked.clear(); save();
+                      if (tracking) refreshBars();
+                      s.sendMessage(Component.text("Cleared all Honored Ones.", NamedTextColor.GRAY));
+                      return true;
+                  }
+                  if (sub.equals("list") && a.length == 1) {
+                      List<String> names = new ArrayList<>();
+                      for (UUID u : marked.keySet()) {
+                          String n = Bukkit.getOfflinePlayer(u).getName();
+                          names.add(n == null ? u.toString() : n);
+                      }
+                      s.sendMessage(Component.text("Honored: " + (names.isEmpty() ? "none" : String.join(", ", names)), NamedTextColor.AQUA));
+                      return true;
+                  }
+                  if (sub.equals("size")) {
+                      if (a.length == 1) {
+                          s.sendMessage(Component.text("Default size is " + sizeMul
+                                  + ". Use /honored size <0.3-4> [player]", NamedTextColor.AQUA));
+                          return true;
+                      }
+                      double v;
+                      try {
+                          v = clamp(Double.parseDouble(a[1]), 0.3, 4.0);
+                      } catch (NumberFormatException ex) {
+                          s.sendMessage(Component.text("Give a number, e.g. /honored size 1.5", NamedTextColor.RED));
+                          return true;
+                      }
+                      if (a.length >= 3) {
+                          Player t = Bukkit.getPlayerExact(a[2]);
+                          if (t == null) {
+                              s.sendMessage(Component.text("Player not found.", NamedTextColor.RED));
+                              return true;
+                          }
+                          sizes.put(t.getUniqueId(), v);
+                          s.sendMessage(Component.text(t.getName() + "'s size set to " + v, NamedTextColor.AQUA));
+                      } else {
+                          sizeMul = v;
+                          sizes.clear();
+                          s.sendMessage(Component.text("Size set to " + v + " for everyone.", NamedTextColor.AQUA));
+                      }
+                      save();
+                      return true;
+                  }
+
+                  if (a.length != 1) {
+                      s.sendMessage(Component.text("Usage: /honored <player|clear|list|size>", NamedTextColor.GRAY));
+                      return true;
+                  }
+                  Player t = Bukkit.getPlayerExact(a[0]);
+                  if (t == null) {
+                      s.sendMessage(Component.text("Player not found.", NamedTextColor.RED));
+                      return true;
+                  }
+                  if (marked.remove(t.getUniqueId()) != null) {
+                      revoke(t);
+                      s.sendMessage(Component.text(t.getName() + " is no longer the Honored One.", NamedTextColor.GRAY));
+                  } else {
+                      marked.put(t.getUniqueId(), new State());
+                      grant(t);
+                      s.sendMessage(Component.text(t.getName() + " is now the Honored One.", NamedTextColor.AQUA));
+                  }
+                  save();
+                  if (tracking) refreshBars();
+                  return true;
+              }
+
+              @Override
+              public List<String> onTabComplete(CommandSender s, Command c, String label, String[] a) {
+                  List<String> out = new ArrayList<>();
+                  String cn = c.getName().toLowerCase();
+                  if (cn.equals("honoredcoords")) {
+                      if (a.length == 1) out.addAll(List.of("on", "off"));
+                  } else if (cn.equals("honored1first") || cn.equals("halo") || cn.equals("redwings")) {
+                      if (a.length == 1) Bukkit.getOnlinePlayers().forEach(p -> out.add(p.getName()));
+                  } else if (a.length == 1) {
+                      out.addAll(List.of("clear", "list", "size"));
+                      Bukkit.getOnlinePlayers().forEach(p -> out.add(p.getName()));
+                  } else if (a.length == 2 && a[0].equalsIgnoreCase("size")) {
+                      out.addAll(List.of("0.5", "1", "1.5", "2", "3"));
+                  } else if (a.length == 3 && a[0].equalsIgnoreCase("size")) {
+                      Bukkit.getOnlinePlayers().forEach(p -> out.add(p.getName()));
+                  }
+                  String pre = a.length == 0 ? "" : a[a.length - 1].toLowerCase();
+                  out.removeIf(x -> !x.toLowerCase().startsWith(pre));
+                  return out;
+              }
+          }
+          EOF_JAVA
+
+      - name: Build
+        run: mvn -B clean package
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: HonoredOne
+          path: target/HonoredOne-*.jar
+          if-no-files-found: error
+
+      - name: Publish jar to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Honored One build ${{ github.run_number }}
+          files: target/HonoredOne-*.jar
